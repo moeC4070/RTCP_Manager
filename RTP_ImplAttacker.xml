@@ -1,0 +1,460 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.6//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_6.dtd'>
+<nta>
+	<declaration>
+// ============================================================
+// DECLARATIONS GLOBALES  (RFC 3550)
+// ============================================================
+
+// --- Canaux de synchronisation broadcast ---
+broadcast chan init_session;   // Ouverture de session
+broadcast chan bye_signal;     // Fermeture de session (RTCP BYE)
+broadcast chan rtp_send;       // Transmission d'un paquet RTP
+
+// --- Metadonnees du paquet RTP courant (§5.1) ---
+int current_ssrc = -1;        // SSRC (32 bits)
+int current_seq  =  0;        // Numero de sequence (16 bits, §5.1)
+int current_ts   =  0;        // Timestamp RTP
+
+// --- Identificateur SSRC du sender legitime ---
+const int SSRC_SENDER = 1000;
+
+// --- Variables d'etat de la session ---
+int  established_ssrc  = -1;
+bool session_active    = false;
+int  packets_received  =  0;
+bool session_closed    = false;
+
+// --- Constantes de configuration ---
+const int MAX_PKTS        = 5;
+const int RTCP_INTERVAL   = 5;
+const int SESSION_TIMEOUT = 20;
+
+// ============================================================
+// ATTAQUE LIEE A L'IMPLEMENTATION : Sequence Number Wrap-Around
+// ============================================================
+// RFC 3550 §5.1 : le numero de sequence est code sur 16 bits
+// (valeurs 0..65535). Une implementation correcte doit utiliser
+// l'arithmetique modulo 2^16 (RFC 3550 §A.1) pour determiner
+// si un paquet est "plus recent" qu'un autre.
+//
+// Faille d'implementation : le Receiver maintient un compteur
+// last_seq de type int (non borne), et accepte un paquet ssi
+// current_seq &gt; last_seq (comparaison entiere simple, SANS
+// modulo). Un attaquant qui connait le SSRC legitime peut
+// injecter quelques paquets avec des numeros de sequence tres
+// eleves (proches de SEQ_MAX = 65535). Apres wrap-around, les
+// paquets legitimes (seq=0, 1, 2...) semblent "anciens" au
+// Receiver qui les rejette =&gt; perte totale du flux legitime.
+//
+// Ce n'est PAS une faille de specification (la RFC definit
+// correctement le wrap-around et l'algo de detection §A.1),
+// mais une faille d'IMPLEMENTATION (le developpeur a omis
+// l'arithmetique modulaire).
+// ============================================================
+
+// UPPAAL utilise des int signes 16 bits (-32768..32767).
+// On simule le wrap-around sur un espace de seq reduit (0..15, soit 4 bits)
+// pour rester dans les bornes. La logique d'attaque est identique.
+const int SEQ_MAX    = 15;  // Valeur maximale (espace 4 bits : 0..15)
+const int SSRC_ATK   = 1000; // Meme SSRC que le sender (paquet forge)
+const int ATK_SEQ_START = 13; // L'attaquant commence pres du max (13,14,15)
+const int ATK_PKTS   = 3;    // Nombre de paquets injectes
+
+int  last_seq_seen   = -1;    // Dernier seq accepte par le Receiver
+bool impl_attack_done = false; // Fin d'injection attaquant
+bool legit_pkt_rejected = false; // Un paquet legitime a ete rejete
+</declaration>
+	<template>
+		<name x="5" y="5">Sender</name>
+		<declaration>
+clock t;
+int   pkt;
+		</declaration>
+		<location id="id0" x="-200" y="0">
+			<name x="-240" y="-30">Idle</name>
+		</location>
+		<location id="id1" x="0" y="0">
+			<name x="-20" y="-30">Active</name>
+		</location>
+		<location id="id2" x="250" y="0">
+			<name x="265" y="-30">Sending</name>
+			<label kind="invariant" x="265" y="-15">t &lt;= 2</label>
+		</location>
+		<location id="id3" x="0" y="200">
+			<name x="-20" y="215">Done</name>
+		</location>
+		<init ref="id0"/>
+		<transition id="id4">
+			<source ref="id3"/>
+			<target ref="id3"/>
+			<nail x="25" y="221"/>
+			<nail x="34" y="195"/>
+		</transition>
+		<transition id="id5">
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-175" y="-35">init_session!</label>
+			<label kind="assignment" x="-175" y="-15">session_active=true, pkt=0, t=0</label>
+		</transition>
+		<transition id="id6">
+			<source ref="id1"/>
+			<target ref="id2"/>
+			<label kind="guard" x="55" y="-45">pkt &lt; MAX_PKTS</label>
+			<label kind="synchronisation" x="55" y="15">rtp_send!</label>
+			<label kind="assignment" x="55" y="-25">current_ssrc=SSRC_SENDER,
+current_seq=pkt,
+current_ts=pkt*160,
+t=0</label>
+		</transition>
+		<transition id="id7">
+			<source ref="id2"/>
+			<target ref="id1"/>
+			<label kind="guard" x="265" y="50">t &gt;= 1</label>
+			<label kind="assignment" x="265" y="70">pkt++</label>
+		</transition>
+		<transition id="id8">
+			<source ref="id1"/>
+			<target ref="id3"/>
+			<label kind="guard" x="-175" y="80">pkt &gt;= MAX_PKTS</label>
+			<label kind="synchronisation" x="-175" y="100">bye_signal!</label>
+			<label kind="assignment" x="-175" y="120">session_active=false</label>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">Receiver</name>
+		<declaration>
+// ============================================================
+// Implementation VULNERABE :
+//   Accepte un paquet ssi current_seq &gt; last_seq_seen
+//   (comparaison entiere simple, SANS arithmetique modulo 2^16)
+//
+// Implementation CORRECTE (RFC 3550 §A.1) aurait utilise :
+//   delta = (current_seq - last_seq_seen) mod 65536
+//   accepter ssi 0 &lt; delta &lt; 32768
+// ============================================================
+clock t_rx;
+		</declaration>
+		<location id="id9" x="-200" y="0">
+			<name x="-240" y="-30">Idle</name>
+		</location>
+		<location id="id10" x="0" y="0">
+			<name x="-20" y="-30">Listening</name>
+			<label kind="invariant" x="10" y="-15">t_rx &lt;= SESSION_TIMEOUT</label>
+		</location>
+		<location id="id11" x="350" y="0">
+			<name x="365" y="-30">Session_OK</name>
+		</location>
+		<location id="id12" x="350" y="200">
+			<name x="365" y="215">Closed</name>
+		</location>
+		<location id="id13" x="0" y="200">
+			<name x="-20" y="215">Timeout</name>
+		</location>
+		<init ref="id9"/>
+		<transition id="id14">
+			<source ref="id12"/>
+			<target ref="id12"/>
+			<nail x="407" y="195"/>
+			<nail x="373" y="212"/>
+		</transition>
+		<transition id="id15">
+			<source ref="id9"/>
+			<target ref="id10"/>
+			<label kind="synchronisation" x="-175" y="-35">init_session?</label>
+			<label kind="assignment" x="-175" y="-15">t_rx=0, packets_received=0,
+established_ssrc=-1, last_seq_seen=-1</label>
+		</transition>
+		<transition id="id16">
+			<source ref="id10"/>
+			<target ref="id11"/>
+			<label kind="guard" x="55" y="-55">current_ssrc == SSRC_SENDER
+&amp;&amp; current_seq &gt; last_seq_seen</label>
+			<label kind="synchronisation" x="55" y="-15">rtp_send?</label>
+			<label kind="assignment" x="55" y="5">established_ssrc=current_ssrc,
+last_seq_seen=current_seq,
+packets_received++,
+t_rx=0</label>
+		</transition>
+		<transition id="id17">
+			<source ref="id11"/>
+			<target ref="id11"/>
+			<label kind="guard" x="460" y="-20">current_ssrc == established_ssrc
+&amp;&amp; current_seq &gt; last_seq_seen
+&amp;&amp; packets_received &lt; MAX_PKTS</label>
+			<label kind="synchronisation" x="460" y="20">rtp_send?</label>
+			<label kind="assignment" x="460" y="40">last_seq_seen=current_seq,
+packets_received++,
+t_rx=0</label>
+			<nail x="320" y="-30"/>
+			<nail x="380" y="-30"/>
+		</transition>
+		<transition id="id18">
+			<source ref="id11"/>
+			<target ref="id11"/>
+			<label kind="guard" x="460" y="60">current_ssrc == established_ssrc
+&amp;&amp; current_seq &lt;= last_seq_seen</label>
+			<label kind="synchronisation" x="460" y="100">rtp_send?</label>
+			<label kind="assignment" x="460" y="120">legit_pkt_rejected=true</label>
+			<nail x="320" y="50"/>
+			<nail x="380" y="50"/>
+		</transition>
+		<transition id="id19">
+			<source ref="id11"/>
+			<target ref="id12"/>
+			<label kind="synchronisation" x="365" y="80">bye_signal?</label>
+			<label kind="assignment" x="365" y="100">session_closed=true</label>
+		</transition>
+		<transition id="id20">
+			<source ref="id10"/>
+			<target ref="id13"/>
+			<label kind="guard" x="5" y="100">t_rx &gt;= SESSION_TIMEOUT</label>
+		</transition>
+		<transition id="id21">
+			<source ref="id10"/>
+			<target ref="id12"/>
+			<label kind="synchronisation" x="-175" y="130">bye_signal?</label>
+			<label kind="assignment" x="-175" y="150">session_closed=true</label>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">RTCP_Manager</name>
+		<declaration>
+clock t_rtcp;
+		</declaration>
+		<location id="id22" x="-200" y="0">
+			<name x="-240" y="-30">Idle</name>
+		</location>
+		<location id="id23" x="0" y="0">
+			<name x="-20" y="-30">Active</name>
+		</location>
+		<location id="id24" x="250" y="0">
+			<name x="265" y="-30">Reporting</name>
+			<committed/>
+		</location>
+		<location id="id25" x="-200" y="150">
+			<name x="-240" y="165">Done</name>
+		</location>
+		<init ref="id22"/>
+		<transition id="id26">
+			<source ref="id25"/>
+			<target ref="id25"/>
+			<nail x="-238" y="144"/>
+			<nail x="-221" y="136"/>
+		</transition>
+		<transition id="id27">
+			<source ref="id22"/>
+			<target ref="id23"/>
+			<label kind="synchronisation" x="-175" y="-35">init_session?</label>
+			<label kind="assignment" x="-175" y="-15">t_rtcp=0</label>
+		</transition>
+		<transition id="id28">
+			<source ref="id23"/>
+			<target ref="id24"/>
+			<label kind="guard" x="55" y="-35">t_rtcp &gt;= RTCP_INTERVAL</label>
+			<label kind="assignment" x="55" y="-15">t_rtcp=0</label>
+		</transition>
+		<transition id="id29">
+			<source ref="id24"/>
+			<target ref="id23"/>
+			<label kind="assignment" x="55" y="50">t_rtcp=0</label>
+		</transition>
+		<transition id="id30">
+			<source ref="id23"/>
+			<target ref="id25"/>
+			<label kind="synchronisation" x="-175" y="65">bye_signal?</label>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">Attacker</name>
+		<declaration>
+// ============================================================
+// Attacker : Sequence Number Wrap-Around Attack
+//
+// Strategie :
+//   1. Attendre que la session soit etablie (established_ssrc connu).
+//   2. Injecter ATK_PKTS paquets avec le MEME SSRC que le sender
+//      legitime (SSRC_ATK = SSRC_SENDER = 1000) mais avec des
+//      numeros de sequence tres eleves (ATK_SEQ_START = 65533).
+//   3. Le Receiver (implementation vulnerable) met last_seq_seen
+//      a 65535 apres le dernier paquet attaquant.
+//   4. Les paquets legitimes suivants (seq=1,2,3...) ont
+//      current_seq &lt; last_seq_seen =&gt; REJETES.
+//
+// Pourquoi c'est une attaque d'IMPLEMENTATION et non de spec :
+//   - La RFC 3550 §A.1 definit explicitement l'algo de detection
+//     de "paquet plus recent" via arithmetique modulo 2^16.
+//   - Une implementation conforme aurait rejete les paquets de
+//     l'attaquant (delta &gt; 32768 =&gt; considered old).
+//   - Seul un Receiver qui omet le modulo est vulnerable.
+// ============================================================
+clock t_atk;
+int   atk_pkt;
+int   atk_seq;
+		</declaration>
+		<location id="id31" x="-250" y="0">
+			<name x="-290" y="-30">Idle</name>
+		</location>
+		<location id="id32" x="0" y="0">
+			<name x="-20" y="-30">Waiting</name>
+		</location>
+		<location id="id33" x="250" y="0">
+			<name x="265" y="-30">Injecting</name>
+			<label kind="invariant" x="265" y="-15">t_atk &lt;= 2</label>
+		</location>
+		<location id="id34" x="0" y="204">
+			<name x="-20" y="219">Done</name>
+		</location>
+		<init ref="id31"/>
+		<transition id="id35">
+			<source ref="id31"/>
+			<target ref="id32"/>
+			<label kind="synchronisation" x="-200" y="-35">init_session?</label>
+			<label kind="assignment" x="-200" y="-15">atk_pkt=0, t_atk=0,
+atk_seq=ATK_SEQ_START</label>
+		</transition>
+		<transition id="id36">
+			<source ref="id32"/>
+			<target ref="id33"/>
+			<label kind="guard" x="55" y="-80">atk_pkt &lt; ATK_PKTS
+&amp;&amp; t_atk &gt;= 1
+&amp;&amp; established_ssrc == SSRC_SENDER</label>
+			<label kind="synchronisation" x="55" y="-35">rtp_send!</label>
+			<label kind="assignment" x="55" y="-15">current_ssrc=SSRC_ATK,
+current_seq=atk_seq,
+current_ts=atk_seq*160,
+t_atk=0</label>
+		</transition>
+		<transition id="id37">
+			<source ref="id33"/>
+			<target ref="id32"/>
+			<label kind="guard" x="265" y="50">t_atk &gt;= 1</label>
+			<label kind="assignment" x="265" y="70">atk_pkt++,
+atk_seq = (atk_seq + 1) % (SEQ_MAX + 1)</label>
+		</transition>
+		<transition id="id38">
+			<source ref="id32"/>
+			<target ref="id34"/>
+			<label kind="guard" x="-187" y="68">atk_pkt &gt;= ATK_PKTS</label>
+			<label kind="assignment" x="-187" y="88">impl_attack_done=true</label>
+		</transition>
+		<transition id="id39">
+			<source ref="id34"/>
+			<target ref="id34"/>
+			<nail x="25" y="225"/>
+			<nail x="34" y="199"/>
+		</transition>
+		<transition id="id40">
+			<source ref="id32"/>
+			<target ref="id34"/>
+			<label kind="synchronisation" x="-187" y="108">bye_signal?</label>
+			<label kind="assignment" x="-187" y="128">impl_attack_done=true</label>
+		</transition>
+	</template>
+	<system>
+sender   = Sender();
+receiver = Receiver();
+rtcp     = RTCP_Manager();
+attacker = Attacker();
+
+system sender, receiver, rtcp, attacker;
+</system>
+	<queries>
+		<query>
+			<formula>A[] not deadlock</formula>
+			<comment>1. [Safety] Absence de deadlock dans tous les etats atteignables</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Session_OK</formula>
+			<comment>2. [Reachability] La session RTP peut etre etablie (1er paquet accepte)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Closed</formula>
+			<comment>3. [Reachability] La session peut se fermer proprement via RTCP BYE</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; sender.Done</formula>
+			<comment>4. [Reachability] Le sender peut transmettre tous ses paquets</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Timeout</formula>
+			<comment>5. [Reachability] Un timeout de session est possible</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; rtcp.Reporting</formula>
+			<comment>6. [Reachability] Le RTCP_Manager peut emettre un rapport SR/RR</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; attacker.Done</formula>
+			<comment>7. [Reachability - Attacker] L'attaquant peut injecter tous ses paquets et terminer</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; impl_attack_done &amp;&amp; legit_pkt_rejected</formula>
+			<comment>8. [VULNERABILITE DEMONTREE] Il existe un chemin ou apres l'attaque, un paquet legitime est rejete =&gt; le flux est interrompu. Cette propriete doit etre SATISFIABLE (E&lt;&gt;) pour prouver la vulnerabilite.</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] receiver.Session_OK imply established_ssrc == SSRC_SENDER</formula>
+			<comment>9. [Safety] En session, le SSRC enregistre est toujours celui du sender (verifie car SSRC_ATK == SSRC_SENDER dans cette attaque)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:54 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; attacker.Done &amp;&amp; last_seq_seen &gt;= 13</formula>
+			<comment>10. [Post-attaque] Il existe un chemin ou l'attaquant a termine ET last_seq_seen a ete pollue (&gt;= 13). Formule E&lt;&gt; car A[] echoue : impl_attack_done devient aussi vrai via bye_signal sans injection, laissant last_seq_seen=-1.</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; legit_pkt_rejected &amp;&amp; attacker.Injecting</formula>
+			<comment>11. [Causalite] Il existe un chemin ou un paquet legitime est rejete pendant que lattaquant est en train dinjecter — prouve que le rejet est cause par linjection (A[] imply echoue car le rejet survient durant linjection avant impl_attack_done=true)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; impl_attack_done &amp;&amp; packets_received &lt; MAX_PKTS &amp;&amp; receiver.Session_OK</formula>
+			<comment>12. [Impact] Il existe un chemin ou l'attaque est finie mais le receiver n'a pas recu tous les paquets (perte de flux partielle)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] sender.Active imply session_active</formula>
+			<comment>13. [Safety] Sender actif implique session active</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] receiver.Closed imply session_closed</formula>
+			<comment>14. [Safety] Etat Closed implique session_closed vrai</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] rtcp.Active imply session_active</formula>
+			<comment>15. [Safety] RTCP_Manager actif seulement quand session active</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Closed &amp;&amp; sender.Done</formula>
+			<comment>16. [Reachability] Terminaison complete possible (sender + receiver fermes)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 21:01:55 +0100">
+			</result>
+		</query>
+	</queries>
+</nta>

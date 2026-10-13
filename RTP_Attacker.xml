@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.6//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_6.dtd'>
+<nta>
+	<declaration>
+// ============================================================
+// DECLARATIONS GLOBALES  (RFC 3550)
+// ============================================================
+
+// --- Canaux de synchronisation broadcast ---
+broadcast chan init_session;   // Ouverture de session (application join)
+broadcast chan bye_signal;     // Fermeture de session (RTCP BYE, §6.6)
+broadcast chan rtp_send;       // Transmission d'un paquet RTP (§5)
+
+// --- Metadonnees du paquet RTP courant (§5.1) ---
+// Ecrites par le Sender avant le broadcast rtp_send!
+int current_ssrc = -1;        // SSRC : Synchronization Source (32 bits)
+int current_seq  =  0;        // Numero de sequence (16 bits, §5.1)
+int current_ts   =  0;        // Timestamp RTP (32 bits, §5.1)
+
+// --- Identificateur SSRC du sender legitime ---
+const int SSRC_SENDER = 1000; // Valeur arbitraire (fixe dans ce modele)
+
+// --- Variables d'etat de la session ---
+int  established_ssrc  = -1;  // SSRC accepte par le receiver
+bool session_active    = false;// Session RTP en cours
+int  packets_received  =  0;  // Paquets RTP acceptes par le receiver
+bool session_closed    = false;// Session ferme via RTCP BYE
+
+// --- Constantes de configuration ---
+const int MAX_PKTS      = 5;  // Nombre de paquets RTP a envoyer
+const int RTCP_INTERVAL = 5;  // Intervalle RTCP minimum (§6.2, abstrait)
+const int SESSION_TIMEOUT = 20;// Timeout de session au niveau receiver
+
+// --- Attacker ---
+const int SSRC_ATTACKER = 9999; // SSRC usurpe par l'attaquant (spoofing)
+const int ATK_PKTS      = 3;    // Nombre de paquets injectes par l'attaquant
+bool      attack_done   = false; // Indique que l'attaquant a fini d'injecter
+</declaration>
+	<template>
+		<name x="5" y="5">Sender</name>
+		<declaration>
+clock t;    // Horloge : delai inter-paquets
+int   pkt;  // Compteur de paquets envoyes
+  </declaration>
+		<location id="id0" x="-200" y="0">
+			<name x="-240" y="-30">Idle</name>
+		</location>
+		<location id="id1" x="0" y="0">
+			<name x="-20" y="-30">Active</name>
+		</location>
+		<location id="id2" x="250" y="0">
+			<name x="265" y="-30">Sending</name>
+			<label kind="invariant" x="265" y="-15">t &lt;= 2</label>
+		</location>
+		<location id="id3" x="0" y="200">
+			<name x="-20" y="215">Done</name>
+		</location>
+		<init ref="id0"/>
+		<transition id="id4">
+			<target ref="id3"/>
+			<nail x="25" y="221"/>
+			<nail x="25" y="221"/>
+			<nail x="34" y="195"/>
+		</transition>
+		<transition id="id5">
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-175" y="-35">init_session!</label>
+			<label kind="assignment" x="-161" y="-68">session_active=true, pkt=0, t=0</label>
+		</transition>
+		<transition id="id6">
+			<source ref="id1"/>
+			<target ref="id2"/>
+			<label kind="guard" x="55" y="-45">pkt &lt; MAX_PKTS</label>
+			<label kind="synchronisation" x="55" y="15">rtp_send!</label>
+			<label kind="assignment" x="42" y="34">current_ssrc=SSRC_SENDER,
+current_seq=pkt,
+current_ts=pkt*160,
+t=0</label>
+		</transition>
+		<transition id="id7">
+			<source ref="id2"/>
+			<target ref="id1"/>
+			<label kind="guard" x="265" y="50">t &gt;= 1</label>
+			<label kind="assignment" x="265" y="70">pkt++</label>
+		</transition>
+		<transition id="id8">
+			<source ref="id1"/>
+			<target ref="id3"/>
+			<label kind="guard" x="-187" y="68">pkt &gt;= MAX_PKTS</label>
+			<label kind="synchronisation" x="-187" y="85">bye_signal!</label>
+			<label kind="assignment" x="-187" y="110">session_active=false</label>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">Receiver</name>
+		<declaration>
+clock t_rx;  // Timer de timeout de session (RFC 3550 §6.3.5)
+  </declaration>
+		<location id="id9" x="-204" y="42">
+			<name x="-244" y="12">Idle</name>
+		</location>
+		<location id="id10" x="0" y="76">
+			<name x="-42" y="42">Listening</name>
+			<label kind="invariant" x="59" y="68">t_rx &lt;= SESSION_TIMEOUT</label>
+		</location>
+		<location id="id11" x="374" y="8">
+			<name x="382" y="17">Session_OK</name>
+		</location>
+		<location id="id12" x="300" y="200">
+			<name x="315" y="215">Closed</name>
+		</location>
+		<location id="id13" x="0" y="200">
+			<name x="-20" y="215">Timeout</name>
+		</location>
+		<init ref="id9"/>
+		<transition id="id14">
+			<source ref="id12"/>
+			<target ref="id12"/>
+			<nail x="357" y="195"/>
+			<nail x="323" y="212"/>
+		</transition>
+		<transition id="id15">
+			<source ref="id9"/>
+			<target ref="id10"/>
+			<label kind="synchronisation" x="-175" y="-35">init_session?</label>
+			<label kind="assignment" x="-391" y="-17">t_rx=0, packets_received=0, established_ssrc=-1</label>
+		</transition>
+		<transition id="id16">
+			<source ref="id10"/>
+			<target ref="id11"/>
+			<label kind="guard" x="55" y="-55">current_ssrc == SSRC_SENDER &amp;&amp; packets_received &lt; MAX_PKTS</label>
+			<label kind="synchronisation" x="55" y="-35">rtp_send?</label>
+			<label kind="assignment" x="55" y="-15">established_ssrc=current_ssrc,
+packets_received++,
+t_rx=0</label>
+		</transition>
+		<transition id="id17">
+			<source ref="id11"/>
+			<target ref="id11"/>
+			<label kind="guard" x="484" y="-12">current_ssrc == established_ssrc &amp;&amp; packets_received &lt; MAX_PKTS</label>
+			<label kind="synchronisation" x="484" y="8">rtp_send?</label>
+			<label kind="assignment" x="484" y="28">packets_received++, t_rx=0</label>
+			<nail x="344" y="-22"/>
+			<nail x="404" y="-22"/>
+		</transition>
+		<transition id="id18">
+			<source ref="id11"/>
+			<target ref="id12"/>
+			<label kind="synchronisation" x="357" y="85">bye_signal?</label>
+			<label kind="assignment" x="357" y="102">session_closed=true</label>
+		</transition>
+		<transition id="id19">
+			<source ref="id10"/>
+			<target ref="id13"/>
+			<label kind="guard" x="17" y="178">t_rx &gt;= SESSION_TIMEOUT</label>
+		</transition>
+		<transition id="id20">
+			<source ref="id10"/>
+			<target ref="id12"/>
+			<label kind="synchronisation" x="-175" y="130">bye_signal?</label>
+			<label kind="assignment" x="-175" y="150">session_closed=true</label>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">RTCP_Manager</name>
+		<declaration>
+clock t_rtcp;    // Horloge : intervalle RTCP
+  </declaration>
+		<location id="id21" x="-255" y="17">
+			<name x="-295" y="-13">Idle</name>
+		</location>
+		<location id="id22" x="0" y="0">
+			<name x="-20" y="-30">Active</name>
+		</location>
+		<location id="id23" x="280" y="34">
+			<name x="295" y="4">Reporting</name>
+			<committed/>
+		</location>
+		<location id="id24" x="-119" y="187">
+			<name x="-159" y="202">Done</name>
+		</location>
+		<init ref="id21"/>
+		<transition id="id25">
+			<source ref="id24"/>
+			<target ref="id24"/>
+			<nail x="-157" y="181"/>
+			<nail x="-140" y="173"/>
+		</transition>
+		<transition id="id26">
+			<source ref="id21"/>
+			<target ref="id22"/>
+			<label kind="synchronisation" x="-175" y="-35">init_session?</label>
+			<label kind="assignment" x="-175" y="-15">t_rtcp=0</label>
+		</transition>
+		<transition id="id27">
+			<source ref="id22"/>
+			<target ref="id23"/>
+			<label kind="guard" x="55" y="-35">t_rtcp &gt;= RTCP_INTERVAL</label>
+			<label kind="assignment" x="55" y="-15">t_rtcp=0</label>
+		</transition>
+		<transition id="id28">
+			<source ref="id23"/>
+			<target ref="id22"/>
+			<label kind="assignment" x="55" y="50">t_rtcp=0</label>
+		</transition>
+		<transition id="id29">
+			<source ref="id22"/>
+			<target ref="id24"/>
+			<label kind="synchronisation" x="-175" y="65">bye_signal?</label>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">Attacker</name>
+		<declaration>
+// ============================================================
+// Attacker : SSRC-spoofing / RTP injection (RFC 3550 §9)
+// L'attaquant attend l'ouverture de session, puis injecte
+// ATK_PKTS paquets RTP avec un SSRC usurpe (SSRC_ATTACKER).
+//
+// Corrections apportees :
+//   1. Garde t_atk >= 1 avant la PREMIERE injection (evite
+//      l'injection immediate a t=0, avant le sender legitime).
+
+// ============================================================
+clock t_atk;   // Horloge inter-injections
+int   atk_pkt; // Compteur de paquets injectes
+        </declaration>
+		<location id="id30" x="-250" y="0">
+			<name x="-290" y="-30">Idle</name>
+		</location>
+		<location id="id31" x="0" y="0">
+			<name x="-20" y="-30">Waiting</name>
+		</location>
+		<location id="id32" x="250" y="0">
+			<name x="265" y="-30">Injecting</name>
+			<label kind="invariant" x="265" y="-15">t_atk &lt;= 2</label>
+		</location>
+		<location id="id33" x="0" y="204">
+			<name x="-20" y="219">Done</name>
+		</location>
+		<init ref="id30"/>
+		<transition id="id34">
+			<source ref="id30"/>
+			<target ref="id31"/>
+			<label kind="synchronisation" x="-200" y="-35">init_session?</label>
+			<label kind="assignment" x="-200" y="-15">atk_pkt=0, t_atk=0</label>
+		</transition>
+		<transition id="id35">
+			<source ref="id31"/>
+			<target ref="id32"/>
+			<label kind="guard" x="55" y="-70">atk_pkt &lt; ATK_PKTS &amp;&amp; t_atk &gt;= 1 &amp;&amp; established_ssrc == SSRC_SENDER</label>
+			<label kind="synchronisation" x="55" y="-50">rtp_send!</label>
+			<label kind="assignment" x="55" y="-30">current_ssrc=SSRC_ATTACKER,
+current_seq=atk_pkt,
+current_ts=atk_pkt*160,
+t_atk=0</label>
+		</transition>
+		<transition id="id36">
+			<source ref="id32"/>
+			<target ref="id31"/>
+			<label kind="guard" x="265" y="50">t_atk &gt;= 1</label>
+			<label kind="assignment" x="265" y="70">atk_pkt++</label>
+		</transition>
+		<transition id="id37">
+			<source ref="id31"/>
+			<target ref="id33"/>
+			<label kind="guard" x="-187" y="68">atk_pkt &gt;= ATK_PKTS</label>
+			<label kind="assignment" x="-187" y="88">attack_done=true</label>
+		</transition>
+		<transition id="id38">
+			<source ref="id33"/>
+			<target ref="id33"/>
+			<nail x="25" y="225"/>
+			<nail x="34" y="199"/>
+		</transition>
+		<transition id="id39">
+			<source ref="id31"/>
+			<target ref="id33"/>
+			<label kind="synchronisation" x="-187" y="108">bye_signal?</label>
+			<label kind="assignment" x="-187" y="128">attack_done=true</label>
+		</transition>
+	</template>
+	<system>
+sender   = Sender();
+receiver = Receiver();
+rtcp     = RTCP_Manager();
+attacker = Attacker();
+
+system sender, receiver, rtcp, attacker;
+</system>
+	<queries>
+		<query>
+			<formula>A[] not deadlock</formula>
+			<comment>1. [Safety] Absence de deadlock dans tous les etats atteignables</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Session_OK</formula>
+			<comment>2. [Reachability] La session RTP peut etre etablie (1er paquet accepte)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Closed</formula>
+			<comment>3. [Reachability] La session peut se fermer proprement via RTCP BYE</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; sender.Done</formula>
+			<comment>4. [Reachability] Le sender peut transmettre tous ses paquets et terminer</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; packets_received &gt;= MAX_PKTS</formula>
+			<comment>5. [Reachability] Le receiver peut recevoir tous les paquets (MAX_PKTS)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Timeout</formula>
+			<comment>6. [Reachability] Un timeout de session est possible (aucun paquet recu)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; rtcp.Reporting</formula>
+			<comment>7. [Reachability] Le RTCP_Manager peut emettre au moins un rapport SR/RR</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 14:04:52 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] sender.Active imply packets_received &lt;= MAX_PKTS</formula>
+			<comment>8. [Liveness] Le receiver ne depasse jamais MAX_PKTS paquets acceptes</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] receiver.Session_OK imply established_ssrc == SSRC_SENDER</formula>
+			<comment>9. [Safety] En session, le SSRC enregistre est toujours celui du sender legitime</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] receiver.Session_OK imply established_ssrc != -1</formula>
+			<comment>10. [Safety] En session etablie, le SSRC ne peut pas etre indefini (-1)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] sender.Active imply session_active</formula>
+			<comment>11. [Safety] Sender actif implique que la session est marquee active</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] receiver.Closed imply session_closed</formula>
+			<comment>12. [Safety] Etat Closed implique que session_closed est mis a vrai</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] rtcp.Active imply session_active</formula>
+			<comment>13. [Safety] RTCP_Manager actif seulement quand la session est active</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; sender.Done &amp;&amp; rtcp.Done</formula>
+			<comment>14. [Reachability] Il existe un chemin ou sender ET rtcp terminent tous les deux</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; receiver.Closed &amp;&amp; sender.Done</formula>
+			<comment>15. [Reachability] Il existe un chemin de terminaison complete (sender + receiver fermes)</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-24 15:07:00 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; attacker.Done</formula>
+			<comment>16. [Reachability - Attacker] L'attaquant peut injecter tous ses paquets et terminer</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 14:04:46 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; attack_done &amp;&amp; receiver.Session_OK &amp;&amp; established_ssrc == SSRC_SENDER</formula>
+			<comment>17. [Attack Contained] Apres injection attaquant, la session reste etablie avec le SSRC legitime</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 14:04:49 +0100">
+			</result>
+		</query>
+		<query>
+			<formula>A[] attacker.Done imply attack_done</formula>
+			<comment>18. [Safety - Attacker] L'etat Done de l'attaquant implique attack_done est vrai</comment>
+			<result outcome="success" type="quality" timestamp="2026-04-27 14:04:55 +0100">
+			</result>
+		</query>
+	</queries>
+</nta>
